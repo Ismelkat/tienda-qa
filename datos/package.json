@@ -1,0 +1,18 @@
+{
+  "name": "datos",
+  "version": "1.0.0",
+  "description": "",
+  "main": "1-generar-dump-real.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dump-real": "node 1-generar-dump-real.js",
+    "anonimizar": "node 2-anonimizar.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@faker-js/faker": "^10.6.0"
+  }
+}
