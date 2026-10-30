@@ -3,3 +3,6 @@ node_modules/
 __pycache__/
 .venv/
 datos/clientes.json
+e2e/resultados/
+e2e/allure-results/
+.pytest_cache/
