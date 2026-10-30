@@ -1,0 +1,114 @@
+# Pipeline CI/CD de la tienda: Build -> SmokeTests -> LoadTest -> Deploy
+#
+# QUALITY GATES (si uno falla, las etapas siguientes NO se ejecutan):
+#   GATE 1 (SmokeTests): node tests/smoke-api.js sale con exit 1 si la app no "enciende".
+#   GATE 2 (LoadTest)  : node tests/carga-simple.js sale con exit 1 si p95 >= SLA o error >= 1%.
+#   El stage Deploy depende de LoadTest: si el gate falla, el deploy queda bloqueado.
+#
+# Para forzar el ROJO: Run pipeline -> cambiar el parametro slaP95Ms a 0.1.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: slaP95Ms
+    displayName: 'SLA de carga: p95 maximo en ms (usa 0.1 para forzar ROJO)'
+    type: string
+    default: '800'
+
+variables:
+  NODE_VERSION: '20.x'
+  APP_DIR: 'app-tienda'
+  TEST_DIR: 'pipeline'
+
+stages:
+  # ------------------------------------------------------------
+  - stage: Build
+    displayName: 'Build - instalar y generar datos'
+    jobs:
+      - job: build
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+          - script: npm install
+            displayName: 'npm install (postinstall genera db.json con Faker)'
+            workingDirectory: '$(APP_DIR)'
+          - script: |
+              node -e "const d=require('./datos/db.json'); console.log('productos:', d.productos.length); if (d.productos.length < 20) process.exit(1)"
+            displayName: 'Verificar datos generados (minimo 20 productos)'
+            workingDirectory: '$(APP_DIR)'
+
+  # ------------------------------------------------------------
+  - stage: SmokeTests
+    displayName: 'Smoke - la app encendio (GATE 1)'
+    dependsOn: Build
+    jobs:
+      - job: smoke
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+          # App y pruebas en UN solo paso: los procesos en background mueren al terminar el paso.
+          - script: |
+              set -e
+              cd "$(Build.SourcesDirectory)/$(APP_DIR)"
+              npm install
+              nohup node servidor/server.js </dev/null > "$(Build.SourcesDirectory)/app.log" 2>&1 &
+              LISTA=0
+              for i in $(seq 1 20); do
+                if curl -sf http://localhost:3000/api/health > /dev/null; then LISTA=1; break; fi
+                sleep 1
+              done
+              if [ "$LISTA" != "1" ]; then echo "La app no arranco"; cat "$(Build.SourcesDirectory)/app.log"; exit 1; fi
+              cd "$(Build.SourcesDirectory)/$(TEST_DIR)"
+              node tests/smoke-api.js
+            displayName: 'Arrancar app + smoke test (GATE 1)'
+            env:
+              BASE_URL: 'http://localhost:3000'
+
+  # ------------------------------------------------------------
+  - stage: LoadTest
+    displayName: 'Carga - SLA p95 y error (GATE 2)'
+    dependsOn: SmokeTests
+    jobs:
+      - job: carga
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+          - script: |
+              set -e
+              cd "$(Build.SourcesDirectory)/$(APP_DIR)"
+              npm install
+              nohup node servidor/server.js </dev/null > "$(Build.SourcesDirectory)/app.log" 2>&1 &
+              LISTA=0
+              for i in $(seq 1 20); do
+                if curl -sf http://localhost:3000/api/health > /dev/null; then LISTA=1; break; fi
+                sleep 1
+              done
+              if [ "$LISTA" != "1" ]; then echo "La app no arranco"; cat "$(Build.SourcesDirectory)/app.log"; exit 1; fi
+              cd "$(Build.SourcesDirectory)/$(TEST_DIR)"
+              node tests/carga-simple.js
+            displayName: 'Arrancar app + prueba de carga (GATE 2: exit 1 si no cumple SLA)'
+            env:
+              BASE_URL: 'http://localhost:3000'
+              CONCURRENCIA: '15'
+              DURACION_S: '8'
+              SLA_P95_MS: '${{ parameters.slaP95Ms }}'
+              SLA_ERROR_PCT: '1'
+
+  # ------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy (simulado) - solo si pasaron los dos gates'
+    dependsOn: LoadTest
+    jobs:
+      - job: deploy
+        steps:
+          - script: echo "Gates en verde. Aqui iria el despliegue real (Fase 5: ACR / App Service)."
+            displayName: 'Desplegar (simulado)'
