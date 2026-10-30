@@ -110,5 +110,5 @@ stages:
     jobs:
       - job: deploy
         steps:
-          - script: echo "Gates en verde. Aqui iria el despliegue real (Fase 5: ACR / App Service)."
+          - script: echo "Gates en verde. Aqui iria el despliegue real (Fase 5 - ACR o App Service)."
             displayName: 'Desplegar (simulado)'
