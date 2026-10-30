@@ -1,11 +1,15 @@
-# Pipeline CI/CD de la tienda: Build -> SmokeTests -> LoadTest -> Deploy
+# Pipeline CI/CD de la tienda: Build -> SmokeTests -> LoadTest -> E2E -> Deploy
 #
 # QUALITY GATES (si uno falla, las etapas siguientes NO se ejecutan):
 #   GATE 1 (SmokeTests): node tests/smoke-api.js sale con exit 1 si la app no "enciende".
 #   GATE 2 (LoadTest)  : node tests/carga-simple.js sale con exit 1 si p95 >= SLA o error >= 1%.
-#   El stage Deploy depende de LoadTest: si el gate falla, el deploy queda bloqueado.
+#   GATE 3 (E2E)       : pytest sale con codigo distinto de 0 si algun escenario BDD falla.
+#   El stage Deploy depende de E2E (que depende de LoadTest): si un gate falla, el deploy queda bloqueado.
 #
-# Para forzar el ROJO: Run pipeline -> cambiar el parametro slaP95Ms a 0.1.
+# Para forzar el ROJO de carga: Run pipeline -> cambiar el parametro slaP95Ms a 0.1.
+#
+# E2E publica el JUnit en la pestana Tests y, si existe el secreto AZURE_DEVOPS_PAT,
+# actualiza los Test Points del Test Plan (Plan 1, Suite 2) con Passed/Failed.
 
 trigger:
   branches:
@@ -13,18 +17,22 @@ trigger:
       - main
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: 'ubuntu-24.04'
 
 parameters:
   - name: slaP95Ms
-    displayName: 'SLA de carga: p95 maximo en ms (usa 0.1 para forzar ROJO)'
+    displayName: 'SLA de carga - p95 maximo en ms (usa 0.1 para forzar ROJO)'
     type: string
     default: '800'
 
 variables:
   NODE_VERSION: '20.x'
+  PYTHON_VERSION: '3.12'
   APP_DIR: 'app-tienda'
   TEST_DIR: 'pipeline'
+  E2E_DIR: 'e2e'
+  TEST_PLAN_ID: '1'
+  TEST_SUITE_ID: '2'
 
 stages:
   # ------------------------------------------------------------
@@ -95,7 +103,7 @@ stages:
               if [ "$LISTA" != "1" ]; then echo "La app no arranco"; cat "$(Build.SourcesDirectory)/app.log"; exit 1; fi
               cd "$(Build.SourcesDirectory)/$(TEST_DIR)"
               node tests/carga-simple.js
-            displayName: 'Arrancar app + prueba de carga (GATE 2: exit 1 si no cumple SLA)'
+            displayName: 'Arrancar app + prueba de carga (GATE 2, exit 1 si no cumple SLA)'
             env:
               BASE_URL: 'http://localhost:3000'
               CONCURRENCIA: '15'
@@ -104,11 +112,71 @@ stages:
               SLA_ERROR_PCT: '1'
 
   # ------------------------------------------------------------
-  - stage: Deploy
-    displayName: 'Deploy (simulado) - solo si pasaron los dos gates'
+  - stage: E2E
+    displayName: 'E2E - Playwright + Screenplay + pytest-bdd (GATE 3)'
     dependsOn: LoadTest
+    jobs:
+      - job: e2e
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(PYTHON_VERSION)'
+          # App viva durante todo el paso: se arranca y se prueba en el mismo script.
+          - script: |
+              set -e
+              cd "$(Build.SourcesDirectory)/$(APP_DIR)"
+              npm install
+              nohup node servidor/server.js </dev/null > "$(Build.SourcesDirectory)/app.log" 2>&1 &
+              LISTA=0
+              for i in $(seq 1 20); do
+                if curl -sf http://localhost:3000/api/health > /dev/null; then LISTA=1; break; fi
+                sleep 1
+              done
+              if [ "$LISTA" != "1" ]; then echo "La app no arranco"; cat "$(Build.SourcesDirectory)/app.log"; exit 1; fi
+              cd "$(Build.SourcesDirectory)/$(E2E_DIR)"
+              pip install -r requirements.txt
+              python -m playwright install --with-deps chromium
+              pytest -o junit_family=xunit1 --junitxml=resultados/junit.xml
+            displayName: 'Arrancar app + escenarios BDD (GATE 3)'
+            env:
+              BASE_URL: 'http://localhost:3000'
+
+          - task: PublishTestResults@2
+            condition: always()
+            displayName: 'Publicar resultados JUnit (pestana Tests)'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(E2E_DIR)/resultados/junit.xml'
+              testRunTitle: 'E2E Tienda - pytest-bdd'
+
+          # Actualiza los Test Points del Test Plan. Solo corre si existe el secreto AZURE_DEVOPS_PAT.
+          - script: python tools/publicar_test_plan.py
+            condition: and(always(), ne(variables['AZURE_DEVOPS_PAT'], ''))
+            displayName: 'Vincular resultados al Test Plan de Azure'
+            workingDirectory: '$(E2E_DIR)'
+            env:
+              AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+              TEST_PLAN_ID: $(TEST_PLAN_ID)
+              TEST_SUITE_ID: $(TEST_SUITE_ID)
+              SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+              SYSTEM_TEAMPROJECT: $(System.TeamProject)
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            displayName: 'Adjuntar resultados como artefacto'
+            inputs:
+              targetPath: '$(E2E_DIR)/resultados'
+              artifact: 'resultados-e2e'
+
+  # ------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy (simulado) - solo si pasaron todos los gates'
+    dependsOn: E2E
     jobs:
       - job: deploy
         steps:
-          - script: echo "Gates en verde. Aqui iria el despliegue real (Fase 5: ACR / App Service)."
+          - script: echo "Gates en verde. Aqui iria el despliegue real (Fase 5 - ACR o App Service)."
             displayName: 'Desplegar (simulado)'
