@@ -1,0 +1,10 @@
+**/node_modules
+.git
+.gitignore
+e2e
+pipeline
+pact
+datos
+app-tienda/datos/db.json
+**/*.md
+**/__pycache__
