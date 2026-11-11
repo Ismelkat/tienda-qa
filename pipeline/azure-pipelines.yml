@@ -1,10 +1,12 @@
-# Pipeline CI/CD de la tienda: Build -> SmokeTests -> LoadTest -> E2E -> Deploy
+# Pipeline CI/CD de la tienda: Build -> SmokeTests -> LoadTest -> E2E -> E2E_Sauce -> Deploy
 #
 # QUALITY GATES (si uno falla, las etapas siguientes NO se ejecutan):
 #   GATE 1 (SmokeTests): node tests/smoke-api.js sale con exit 1 si la app no "enciende".
 #   GATE 2 (LoadTest)  : node tests/carga-simple.js sale con exit 1 si p95 >= SLA o error >= 1%.
 #   GATE 3 (E2E)       : pytest sale con codigo distinto de 0 si algun escenario BDD falla.
-#   El stage Deploy depende de E2E (que depende de LoadTest): si un gate falla, el deploy queda bloqueado.
+#   GATE 4 (E2E_Sauce) : mismas pruebas en navegadores reales de Sauce Labs. Solo corre si existe la
+#                        variable SAUCE_USERNAME; si no existe, la etapa se omite (Skipped).
+#   El stage Deploy se bloquea si falla cualquiera de los gates anteriores.
 #
 # Para forzar el ROJO de carga: Run pipeline -> cambiar el parametro slaP95Ms a 0.1.
 #
@@ -172,9 +174,78 @@ stages:
               artifact: 'resultados-e2e'
 
   # ------------------------------------------------------------
+  # FASE 4 - Ejecucion en la nube (Sauce Labs).
+  # Las MISMAS pruebas corren en un Chrome real de Sauce cambiando solo configuracion:
+  #   SAUCE=1, SAUCE_USERNAME, SAUCE_ACCESS_KEY (secreto), region, navegador y plataforma.
+  # La app corre en el agente (localhost:3000) y Sauce la alcanza por un tunel Sauce Connect.
+  # App, tunel y pruebas van en UN solo paso porque los procesos en background mueren al terminar el paso.
+  # Variables a crear en el pipeline: SAUCE_USERNAME (normal) y SAUCE_ACCESS_KEY (secreta).
+  - stage: E2E_Sauce
+    displayName: 'E2E en Sauce Labs (navegadores reales, via tunel)'
+    dependsOn: E2E
+    condition: and(succeeded(), ne(variables['SAUCE_USERNAME'], ''))
+    jobs:
+      - job: e2e_sauce
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(PYTHON_VERSION)'
+          - script: |
+              set -e
+              cd "$(Build.SourcesDirectory)/$(APP_DIR)"
+              npm install
+              nohup node servidor/server.js </dev/null > "$(Build.SourcesDirectory)/app.log" 2>&1 &
+              LISTA=0
+              for i in $(seq 1 20); do
+                if curl -sf http://localhost:3000/api/health > /dev/null; then LISTA=1; break; fi
+                sleep 1
+              done
+              if [ "$LISTA" != "1" ]; then echo "La app no arranco"; cat "$(Build.SourcesDirectory)/app.log"; exit 1; fi
+
+              cd "$(Build.SourcesDirectory)"
+              curl -sL -o sc.tar.gz https://saucelabs.com/downloads/sauce-connect/5.2.2/sauce-connect-5.2.2_linux.x86_64.tar.gz
+              tar -xzf sc.tar.gz
+              SC_BIN=$(find . -name 'sauce-connect' -type f | head -n1)
+              nohup "$SC_BIN" run --username "$SAUCE_USERNAME" --access-key "$SAUCE_ACCESS_KEY" --region us-west-1 --tunnel-name "$SAUCE_TUNNEL" </dev/null > "$(Build.SourcesDirectory)/tunel.log" 2>&1 &
+              for i in $(seq 1 30); do
+                if curl -sf http://localhost:9000/readiness > /dev/null; then break; fi
+                sleep 2
+              done
+
+              cd "$(Build.SourcesDirectory)/$(E2E_DIR)"
+              pip install -r requirements.txt
+              python -m playwright install chromium
+              pytest -o junit_family=xunit1 --junitxml=resultados/junit-sauce.xml
+            displayName: 'App + tunel Sauce Connect + E2E en navegador real de Sauce'
+            env:
+              SAUCE: '1'
+              SAUCE_USERNAME: $(SAUCE_USERNAME)
+              SAUCE_ACCESS_KEY: $(SAUCE_ACCESS_KEY)
+              SAUCE_REGION: 'us-west-1'
+              SAUCE_BROWSER: 'chrome'
+              SAUCE_PLATFORM: 'Windows 11'
+              SAUCE_TUNNEL: 'tienda-tunnel-$(Build.BuildId)'
+              BASE_URL: 'http://localhost:3000'
+              BUILD_TAG: 'tienda-e2e-$(Build.BuildId)'
+
+          - task: PublishTestResults@2
+            condition: always()
+            displayName: 'Publicar resultados de Sauce (JUnit)'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(E2E_DIR)/resultados/junit-sauce.xml'
+              testRunTitle: 'E2E Tienda - Sauce Labs'
+
+  # ------------------------------------------------------------
   - stage: Deploy
     displayName: 'Deploy (simulado) - solo si pasaron todos los gates'
-    dependsOn: E2E
+    dependsOn:
+      - E2E
+      - E2E_Sauce
+    condition: and(succeeded('E2E'), in(dependencies.E2E_Sauce.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'))
     jobs:
       - job: deploy
         steps:
